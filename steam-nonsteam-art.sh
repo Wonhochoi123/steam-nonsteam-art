@@ -21,11 +21,13 @@
 #
 # Options:
 #   -f, --force        regenerate art even if it already exists
-#   -F, --fullscreen   ALSO rewrite browser shortcuts to launch fullscreen
-#                      (chromium/brave/chrome  --app=URL  ->  --kiosk URL).
-#                      Off by default; native apps are left untouched.
-#                      Requires Steam to be fully closed (it backs up
-#                      shortcuts.vdf first).
+#   -F, --fullscreen   ALSO make shortcuts launch fullscreen:
+#                        - browser shortcuts: --app=URL -> --kiosk URL
+#                        - known config-based apps (e.g. VacuumTube): flip the
+#                          app's own fullscreen setting ("app quirks")
+#                      Off by default; native apps without a known quirk are
+#                      left untouched. Requires Steam (and the quirk app) to be
+#                      closed; backs up every file it edits.
 #   -h, --help         show this help
 #
 # Env overrides:
@@ -272,6 +274,45 @@ if not report: print("(no browser --app shortcuts found to convert)")
 PY
 }
 
+# ---- app quirks: apps that ignore launch flags and store fullscreen in their
+# own config file. Each handler is keyed off a signature found in shortcuts.vdf.
+# To add an app: write a quirk_<name> function (idempotent, backs up, skips if
+# the app is running), then register it in apply_app_quirks below.
+
+# set a top-level boolean key to true in a JSON config, in place, idempotently
+json_set_true(){
+  local cfg="$1" key="$2" label="$3" procmatch="$4"
+  [ -f "$cfg" ] || { echo "$label: config not found, skipped ($cfg)"; return; }
+  if pgrep -fi "$procmatch" >/dev/null 2>&1; then
+    echo "$label: RUNNING — close it and rerun (it would overwrite the change on exit)"; return
+  fi
+  python3 - "$cfg" "$key" "$label" <<'PY'
+import json,sys,shutil
+p,key,label=sys.argv[1],sys.argv[2],sys.argv[3]
+try: c=json.load(open(p))
+except Exception as e: print(f"{label}: cannot parse config ({e})"); sys.exit(0)
+if c.get(key) is True: print(f"{label}: already fullscreen"); sys.exit(0)
+shutil.copy(p,p+'.bak'); c[key]=True
+json.dump(c,open(p,'w'),indent=4)
+print(f"{label}: fullscreen -> true ({p.split('/')[-1]})")
+PY
+}
+
+quirk_vacuumtube(){
+  local cfg="$HOME/.var/app/rocks.shy.VacuumTube/config/VacuumTube/config.json"  # flatpak
+  [ -f "$cfg" ] || cfg="$HOME/.config/VacuumTube/config.json"                    # native fallback
+  json_set_true "$cfg" "fullscreen" "VacuumTube" "vacuumtube"
+}
+
+# dispatch quirks for whichever known apps are present in this shortcuts.vdf
+apply_app_quirks(){
+  local vdf="$1"
+  grep -aq 'rocks.shy.VacuumTube' "$vdf" 2>/dev/null && quirk_vacuumtube
+  # add more apps here, e.g.:
+  #   grep -aq '<signature>' "$vdf" && quirk_<name>
+  return 0
+}
+
 # ---- main ------------------------------------------------------------------
 grids=()
 if [ -n "${GRID:-}" ]; then grids=("$GRID"); else
@@ -292,6 +333,7 @@ if [ "$DO_FS" = "1" ]; then
       [ -f "$vdf" ] || continue
       echo "==> fullscreen: $vdf"
       apply_fullscreen "$vdf" | sed 's/^/    /'
+      apply_app_quirks "$vdf" | sed 's/^/    /'
     done
   fi
 fi

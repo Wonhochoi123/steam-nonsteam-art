@@ -86,6 +86,21 @@ they open borderless fullscreen, like a real game:
   is open** (Steam would overwrite the change on exit).
 - Idempotent — already-fullscreen shortcuts are reported and skipped.
 
+#### App quirks (config-based fullscreen)
+
+Some apps ignore launch flags and store fullscreen in their **own config file**
+(Electron apps, etc.). For those, `--fullscreen` flips the app's own setting:
+
+| App | What it does |
+|-----|--------------|
+| **VacuumTube** (`rocks.shy.VacuumTube`) | sets `"fullscreen": true` in its `config.json` |
+
+Each quirk backs up the file, is idempotent, and **skips while that app is
+running** (it would overwrite the change on exit — close the app and rerun).
+
+Adding another app is a few lines — write a `quirk_<name>` handler and register
+it in `apply_app_quirks` (see the comments in the script).
+
 ### Environment overrides
 
 | Var | Purpose |
