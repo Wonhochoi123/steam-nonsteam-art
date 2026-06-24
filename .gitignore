@@ -1,0 +1,6 @@
+# scratch / test output
+*.bak
+*.bak.*
+/test-grid/
+/tmp/
+*.tmp
