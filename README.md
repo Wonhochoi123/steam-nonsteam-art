@@ -59,12 +59,32 @@ That's it — it finds your Steam install(s), reads your non-Steam shortcuts, an
 generates art for any that don't have it yet.
 
 ```bash
-./steam-nonsteam-art.sh            # only fill in shortcuts missing art (idempotent)
-./steam-nonsteam-art.sh --force    # regenerate everything
-./steam-nonsteam-art.sh --help     # options
+./steam-nonsteam-art.sh              # only fill in shortcuts missing art (idempotent)
+./steam-nonsteam-art.sh --force      # regenerate everything
+./steam-nonsteam-art.sh --fullscreen # also make browser shortcuts launch fullscreen
+./steam-nonsteam-art.sh --help       # options
 ```
 
 **Then fully restart Steam** (Steam → Exit, reopen) to load the new artwork.
+
+### Fullscreen (optional)
+
+Web-app shortcuts (Immich, a YouTube tab, any self-hosted dashboard) are
+usually added as a chromium/brave **app window** (`--app=URL`). Pass
+`--fullscreen` and the tool rewrites those to **kiosk mode** (`--kiosk URL`) so
+they open borderless fullscreen, like a real game:
+
+```bash
+# Quit Steam first, then:
+./steam-nonsteam-art.sh --fullscreen
+```
+
+- **Off by default** — without the flag, launch options are never touched.
+- Only converts shortcuts it can do **safely** (chromium/brave/chrome `--app`);
+  native apps are left alone.
+- **Backs up `shortcuts.vdf`** before editing, and **refuses to run while Steam
+  is open** (Steam would overwrite the change on exit).
+- Idempotent — already-fullscreen shortcuts are reported and skipped.
 
 ### Environment overrides
 

@@ -17,17 +17,23 @@
 # a clean initials tile.
 #
 # Usage:
-#   steam-nonsteam-art.sh [-f|--force] [-h|--help]
+#   steam-nonsteam-art.sh [-f|--force] [-F|--fullscreen] [-h|--help]
 #
 # Options:
-#   -f, --force   regenerate art even if it already exists
-#   -h, --help    show this help
+#   -f, --force        regenerate art even if it already exists
+#   -F, --fullscreen   ALSO rewrite browser shortcuts to launch fullscreen
+#                      (chromium/brave/chrome  --app=URL  ->  --kiosk URL).
+#                      Off by default; native apps are left untouched.
+#                      Requires Steam to be fully closed (it backs up
+#                      shortcuts.vdf first).
+#   -h, --help         show this help
 #
 # Env overrides:
 #   FONT=/path/to/Bold.ttf     force a specific font
 #   ICON_BASE=<url>            override the icon repo base
 #   STEAM_ROOT=/path           force a single Steam root (skip autodetect)
 #   GRID=/path                 force a single output dir (implies one target)
+#   ALLOW_STEAM_RUNNING=1      skip the "is Steam closed?" guard (advanced)
 #
 # Deps: bash, python3, ImageMagick (magick or convert), curl, a bold TTF.
 #
@@ -37,10 +43,13 @@ set -uo pipefail
 # ---------------------------------------------------------------------------
 ICON_BASE="${ICON_BASE:-https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png}"
 FORCE=0
+DO_FS=0
 for a in "$@"; do
   case "$a" in
-    -f|--force) FORCE=1 ;;
-    -h|--help)  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -f|--force)      FORCE=1 ;;
+    -F|--fullscreen) DO_FS=1 ;;
+    --no-fullscreen) DO_FS=0 ;;
+    -h|--help)  awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0"; exit 0 ;;
     *) echo "unknown arg: $a (try --help)"; exit 2 ;;
   esac
 done
@@ -218,6 +227,51 @@ process_grid(){
   echo "    ($count generated)"
 }
 
+# ---- fullscreen: rewrite browser shortcuts to launch in kiosk -------------
+steam_running(){ pgrep -x steam >/dev/null 2>&1 || pgrep -f steamwebhelper >/dev/null 2>&1; }
+
+# Edit one shortcuts.vdf in place: chromium/brave "--app=URL" -> "--kiosk" "URL".
+# Streaming token rewrite (only the LaunchOptions value changes), so the rest of
+# the binary VDF is preserved byte-for-byte. Backs up first.
+apply_fullscreen(){
+  local vdf="$1"
+  [ -f "$vdf" ] || return 0
+  cp "$vdf" "$vdf.bak.$(date +%Y%m%d-%H%M%S)"
+  python3 - "$vdf" <<'PY'
+import sys
+p=sys.argv[1]; d=open(p,'rb').read()
+out=bytearray(); i=0; appname=b''; report=[]
+def transform(name,val):
+    low=val.lower()
+    if b'--kiosk' in low or b'--start-fullscreen' in low: return val,'already'
+    if b'--app=' in val: return val.replace(b'"--app=', b'"--kiosk" "'),'converted'
+    return val,'unchanged'
+while i < len(d):
+    t=d[i]; out.append(t); i+=1
+    if t==0x08:  # end of map
+        continue
+    if t==0x00:  # nested map: copy its name
+        j=d.index(0,i); out+=d[i:j+1]; i=j+1; continue
+    if t==0x01:  # string field
+        j=d.index(0,i); key=d[i:j]; out+=d[i:j+1]; i=j+1
+        j=d.index(0,i); val=d[i:j]; i=j+1
+        kl=key.lower()
+        if kl==b'appname': appname=val
+        if kl==b'launchoptions':
+            val,st=transform(appname,val)
+            if st!='unchanged': report.append((st,appname.decode('utf-8','replace')))
+        out+=val+b'\x00'; continue
+    if t==0x02:  # int field
+        j=d.index(0,i); out+=d[i:j+1]; i=j+1
+        out+=d[i:i+4]; i+=4; continue
+    sys.exit("vdf parse error near byte %d"%(i-1))
+open(p,'wb').write(out)
+for st,n in report:
+    print(("converted" if st=='converted' else "already   ")+f"  {n}")
+if not report: print("(no browser --app shortcuts found to convert)")
+PY
+}
+
 # ---- main ------------------------------------------------------------------
 grids=()
 if [ -n "${GRID:-}" ]; then grids=("$GRID"); else
@@ -226,5 +280,21 @@ fi
 [ "${#grids[@]}" -gt 0 ] || die "no Steam shortcuts.vdf found (add a non-Steam game first, or set STEAM_ROOT/GRID)"
 
 for g in "${grids[@]}"; do process_grid "$g"; done
+
+if [ "$DO_FS" = "1" ]; then
+  echo
+  if steam_running && [ "${ALLOW_STEAM_RUNNING:-0}" != "1" ]; then
+    echo "fullscreen: SKIPPED — Steam is running (it would overwrite the change on exit)."
+    echo "            Fully quit Steam, then rerun with --fullscreen."
+  else
+    for g in "${grids[@]}"; do
+      vdf="$(dirname "$g")/shortcuts.vdf"
+      [ -f "$vdf" ] || continue
+      echo "==> fullscreen: $vdf"
+      apply_fullscreen "$vdf" | sed 's/^/    /'
+    done
+  fi
+fi
+
 echo
-echo "Done. Fully restart Steam (Steam -> Exit, reopen) to load the new artwork."
+echo "Done. Fully restart Steam (Steam -> Exit, reopen) to load the changes."
