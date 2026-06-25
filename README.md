@@ -88,25 +88,36 @@ rewrites them to launch borderless-fullscreen kiosk mode, like a real game:
   is open** (Steam would overwrite the change on exit).
 - Idempotent — already-fullscreen shortcuts are reported and skipped.
 
-#### Zen / Firefox web apps (Esc-to-quit + fresh session)
+#### Zen / Firefox web apps (kiosk, Esc-close, fresh, no-sidebar)
 
 Firefox-based site-specific apps (e.g. those created by **web-app-hub**) ignore
-chromium-style flags and keep their own per-app profile. For every Zen shortcut
-that has its **own** `--profile=`, `--fullscreen` also makes the profile
-kiosk-friendly:
+chromium-style flags, so for every `app.zen_browser.zen` shortcut `--fullscreen`
+also does the following — so each app opens like a real fullscreen "game":
 
-- **Esc quits the app** — binds plain `Escape` → `cmd_quitApplication` in the
-  profile's `zen-keyboard-shortcuts.json` (seeding it from an existing profile
-  if needed). `Ctrl+Q` works too.
-- **Each launch starts fresh** — disables tab/session restore in the profile's
-  `user.js` (`browser.startup.page=1`, `sessionstore.resume_from_crash=false`,
-  `warnOnQuit=false`, …) and clears the piled-up `sessionstore`/`zen-sessions`
-  files once. **Cookies/logins are kept** — only old tabs are forgotten.
+- **Esc closes the app** — a Firefox/Zen **kiosk ignores in-browser Esc
+  bindings**, so closing is handled by the window manager instead. The tool
+  installs `~/.local/bin/zen-kiosk-launch.sh` and re-points each Zen shortcut's
+  `Exe` at it. The launcher binds `Esc → "close window"` in **GNOME** *only
+  while the app is running* and restores the normal binding on exit — so Esc
+  behaves normally everywhere else. (`Alt+F4` also works, always.) Needs
+  **GNOME**; on other desktops the app still launches, just without Esc-close.
+- **Its own profile** — apps that lack a `--profile=` (so they'd run in your
+  *main* Zen profile) are given a **dedicated** one under web-app-hub, derived
+  from their `--class`. This is what lets the per-app settings below apply
+  without touching your everyday browser. _You'll sign in once_ in the new
+  profile; after that the login sticks.
+- **Per-app `user.js`** (written to each app's own profile):
+  - **Fresh every launch** — no tab/session restore
+    (`browser.startup.page=1`, `sessionstore.resume_from_crash=false`, …), and
+    the piled-up `sessionstore`/`zen-sessions` files are cleared once.
+  - **No browsing history** — `places.history.enabled=false`. **Passwords and
+    login cookies are stored separately and kept**, so you stay logged in.
+  - **Sidebar stays closed** — `zen.view.compact*`, `sidebar.visibility=hide-sidebar`,
+    and `zen.view.sidebar-expanded.on-hover=false` so it doesn't pop out.
 
-Every edited file is backed up (`.bak`), it's idempotent, and it **skips while
-Zen is running**. Shortcuts that share the **default** Zen profile (no
-`--profile=`) are **skipped on purpose**, so your everyday browser isn't
-affected — give such apps their own profile if you want the same behaviour.
+Every edited file is backed up (`.bak`), the `shortcuts.vdf` rewrite is guarded
+by a round-trip check, and the whole thing is idempotent. The `user.js` step
+**skips while Zen is running** (close Zen and rerun).
 
 #### App quirks (config-based fullscreen)
 

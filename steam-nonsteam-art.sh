@@ -235,51 +235,163 @@ process_grid(){
 # ---- fullscreen: rewrite browser shortcuts to launch in kiosk -------------
 steam_running(){ pgrep -x steam >/dev/null 2>&1 || pgrep -f steamwebhelper >/dev/null 2>&1; }
 
-# Edit one shortcuts.vdf in place: chromium/brave "--app=URL" -> "--kiosk" "URL".
-# Streaming token rewrite (only the LaunchOptions value changes), so the rest of
-# the binary VDF is preserved byte-for-byte. Backs up first.
+# Esc can't be handled inside a Firefox/Zen kiosk (it ignores custom Esc
+# bindings), so for Zen web apps we close them from the window manager instead.
+# This launcher binds Esc -> "close window" in GNOME *only while the app runs*,
+# and restores the normal binding on exit — so Esc behaves normally everywhere
+# else. steam-nonsteam-art rewrites Zen shortcuts to launch through it.
+ZEN_WRAPPER="$HOME/.local/bin/zen-kiosk-launch.sh"
+install_zen_wrapper(){
+  mkdir -p "$(dirname "$ZEN_WRAPPER")"
+  cat > "$ZEN_WRAPPER" <<'WRAP'
+#!/usr/bin/env bash
+# zen-kiosk-launch.sh — run a kiosk web app, and make Esc close its window
+# (GNOME/Wayland) only while it is running. Managed by steam-nonsteam-art.sh.
+set -u
+SCHEMA=org.gnome.desktop.wm.keybindings
+KEY=close
+restore(){ [ -n "${OLD:-}" ] && gsettings set "$SCHEMA" "$KEY" "$OLD" 2>/dev/null; }
+if command -v gsettings >/dev/null 2>&1; then
+  OLD="$(gsettings get "$SCHEMA" "$KEY" 2>/dev/null)"
+  case "$OLD" in
+    *"'Escape'"*) : ;;   # already bound (e.g. a previous run); leave it, don't restore
+    *)
+      NEW="$(python3 - "$OLD" <<'PY'
+import sys,ast
+s=sys.argv[1].strip()
+if s.startswith('@as '): s=s[4:].strip()
+try: lst=ast.literal_eval(s) if s else []
+except Exception: lst=[]
+if not isinstance(lst,list): lst=[]
+if 'Escape' not in lst: lst.append('Escape')
+print('['+', '.join("'%s'"%x for x in lst)+']')
+PY
+)"
+      gsettings set "$SCHEMA" "$KEY" "$NEW" 2>/dev/null && trap restore EXIT INT TERM
+      ;;
+  esac
+fi
+"$@"   # run the app in the foreground; trap restores the binding when it exits
+WRAP
+  chmod +x "$ZEN_WRAPPER"
+}
+
+# Edit one shortcuts.vdf in place:
+#   * chromium/brave  "--app=URL"            -> "--kiosk" "URL"
+#   * Zen/Firefox     app.zen_browser.zen …  -> insert "--kiosk", and (if a
+#                     wrapper path is given) route Exe through the wrapper so
+#                     Esc closes the app.
+# Uses a full structured parse + reserialize of the binary VDF, guarded by a
+# round-trip check (refuses to write unless re-encoding reproduces the original
+# byte-for-byte). Backs up first.
 apply_fullscreen(){
   local vdf="$1"
   [ -f "$vdf" ] || return 0
   cp "$vdf" "$vdf.bak.$(date +%Y%m%d-%H%M%S)"
-  python3 - "$vdf" <<'PY'
-import sys
-p=sys.argv[1]; d=open(p,'rb').read()
-out=bytearray(); i=0; appname=b''; report=[]
-def transform(name,val):
+  python3 - "$vdf" "${2:-}" <<'PY'
+import sys, shutil, time, re, os
+p=sys.argv[1]; wrapper=(sys.argv[2] if len(sys.argv)>2 else '').encode()
+d=open(p,'rb').read()
+
+pos=0
+def rd():
+    global pos
+    j=d.index(0,pos); s=d[pos:j]; pos=j+1; return s
+def parse():
+    global pos
+    items=[]
+    while True:
+        t=d[pos]; pos+=1
+        if t==0x08: return items
+        k=rd()
+        if   t==0x00: items.append([0x00,k,parse()])
+        elif t==0x01: items.append([0x01,k,rd()])
+        elif t==0x02: v=d[pos:pos+4]; pos+=4; items.append([0x02,k,v])
+        else: sys.exit("vdf: unsupported token 0x%02x at %d"%(t,pos-1))
+top=parse()
+def ser(items):
+    o=bytearray()
+    for t,k,v in items:
+        o.append(t); o+=k+b'\x00'
+        if   t==0x00: o+=ser(v); o.append(0x08)
+        elif t==0x01: o+=v+b'\x00'
+        elif t==0x02: o+=v
+    return o
+if bytes(ser(top))+b'\x08' != d:
+    sys.exit("vdf round-trip mismatch — refusing to edit (please report)")
+
+def field(entry,key):
+    for it in entry:
+        if it[0]==0x01 and it[1].lower()==key: return it
+    return None
+def kiosk(val):
     low=val.lower()
-    if b'--kiosk' in low or b'--start-fullscreen' in low: return val,'already'
-    if b'--app=' in val: return val.replace(b'"--app=', b'"--kiosk" "'),'converted'
+    if b'--kiosk' in low or b'--start-fullscreen' in low: return val,False
+    if b'--app=' in val: return val.replace(b'"--app=', b'"--kiosk" "'),True
     if b'app.zen_browser.zen' in low:
-        # site-specific Zen/Firefox app: insert "--kiosk" before the URL token
-        for scheme in (b'"http', b'"about:', b'"file:'):
-            k=val.find(scheme)
-            if k!=-1:
-                return val[:k]+b'"--kiosk" '+val[k:],'converted'
-    return val,'unchanged'
-while i < len(d):
-    t=d[i]; out.append(t); i+=1
-    if t==0x08:  # end of map
-        continue
-    if t==0x00:  # nested map: copy its name
-        j=d.index(0,i); out+=d[i:j+1]; i=j+1; continue
-    if t==0x01:  # string field
-        j=d.index(0,i); key=d[i:j]; out+=d[i:j+1]; i=j+1
-        j=d.index(0,i); val=d[i:j]; i=j+1
-        kl=key.lower()
-        if kl==b'appname': appname=val
-        if kl==b'launchoptions':
-            val,st=transform(appname,val)
-            if st!='unchanged': report.append((st,appname.decode('utf-8','replace')))
-        out+=val+b'\x00'; continue
-    if t==0x02:  # int field
-        j=d.index(0,i); out+=d[i:j+1]; i=j+1
-        out+=d[i:i+4]; i+=4; continue
-    sys.exit("vdf parse error near byte %d"%(i-1))
+        for sch in (b'"http', b'"about:', b'"file:'):
+            k=val.find(sch)
+            if k!=-1: return val[:k]+b'"--kiosk" '+val[k:],True
+    return val,False
+
+shortcuts=next((v for t,k,v in top if t==0x00 and k.lower()==b'shortcuts'),[])
+entries=[v for t,k,v in shortcuts if t==0x00]
+
+# Where to put dedicated profiles for Zen apps that don't have one: reuse the
+# folder an existing --profile= lives in, else the web-app-hub default.
+home=os.path.expanduser('~').encode()
+prof_base=home+b'/.var/app/app.zen_browser.zen/data/web-app-hub/profiles'
+for e in entries:
+    lo=field(e,b'launchoptions')
+    if lo:
+        m=re.search(rb'--profile=([^"]+)', lo[2])
+        if m: prof_base=m.group(1).rsplit(b'/',1)[0]; break
+
+def inject_profile(val):
+    # give a Zen app its own profile (so per-app prefs don't touch the main
+    # browser). Profile id = --class/--name minus the web-app-hub "wah-" prefix.
+    if b'--profile=' in val.lower(): return val,False
+    m=re.search(rb'--(?:class|name)=([^"\s]+)', val)
+    if not m: return val,False
+    pid=m.group(1)
+    if pid.startswith(b'wah-'): pid=pid[4:]
+    path=prof_base+b'/'+pid
+    try: os.makedirs(path, exist_ok=True)
+    except OSError: return val,False
+    tok=b'"--profile=' + path + b'" '
+    at=val.find(b'"--no-remote"')
+    if at==-1:
+        for sch in (b'"http', b'"about:', b'"file:'):
+            k=val.find(sch)
+            if k!=-1: at=k; break
+    if at==-1: return val,False
+    return val[:at]+tok+val[at:],True
+
+report=[]
+for e in entries:
+    lo=field(e,b'launchoptions'); ex=field(e,b'exe'); nm=field(e,b'appname')
+    if not lo: continue
+    name=nm[2].decode('utf-8','replace') if nm else '?'
+    lo[2],ch=kiosk(lo[2])
+    if ch: report.append(('kiosk',name))
+    # give shared-profile Zen apps their own profile
+    if b'app.zen_browser.zen' in lo[2].lower():
+        lo[2],ch=inject_profile(lo[2])
+        if ch: report.append(('profile',name))
+    # wrap Zen apps so Esc closes them (handled by the window manager)
+    if wrapper and ex and b'app.zen_browser.zen' in lo[2].lower():
+        if wrapper.split(b'/')[-1] not in ex[2]:
+            lo[2]=ex[2]+b' '+lo[2]          # old Exe becomes argv[0..] for the wrapper
+            ex[2]=b'"'+wrapper+b'"'
+            report.append(('esc',name))
+
+out=bytes(ser(top))+b'\x08'
+shutil.copy(p,p+'.bak.'+time.strftime('%Y%m%d-%H%M%S'))
 open(p,'wb').write(out)
-for st,n in report:
-    print(("converted" if st=='converted' else "already   ")+f"  {n}")
-if not report: print("(no browser --app shortcuts found to convert)")
+labels={'kiosk':'kiosk    ','profile':'own-prof ','esc':'esc-close'}
+for kind,n in report:
+    print(labels.get(kind,kind)+f"  {n}")
+if not report: print("(no shortcuts needed fullscreen/esc changes)")
 PY
 }
 
@@ -360,33 +472,23 @@ for lo in launch:
 if not profiles and not shared:
     print("(no Zen web-app shortcuts found)"); sys.exit(0)
 
-# --- a complete default zen-keyboard-shortcuts.json to seed bare profiles -----
-def find_template():
-    cands = [p for _, p in profiles]
-    cands += glob.glob(os.path.join(home, '.var/app/app.zen_browser.zen/*/zen*/*.default*'))
-    for base in cands:
-        f = os.path.join(base, 'zen-keyboard-shortcuts.json')
-        if os.path.isfile(f):
-            try:
-                j = json.load(open(f))
-                if isinstance(j, dict) and isinstance(j.get('shortcuts'), list) and j['shortcuts']:
-                    return j
-            except Exception: pass
-    return None
-template = find_template()
-
-ESC = {"id": "key_quitAppOnEscape", "key": None, "keycode": "VK_ESCAPE",
-       "group": "windowAndTabManagement", "l10nId": None,
-       "modifiers": {"control": False, "alt": False, "shift": False, "meta": False, "accel": False},
-       "action": "cmd_quitApplication", "disabled": False, "reserved": True, "internal": False}
-
 PREFS = [
+    'user_pref("zen.welcome-screen.seen", true);',                 # no welcome tour in fresh profiles
+    # fresh launch: never restore the previous tabs/windows (stops the pile-up)
     'user_pref("browser.startup.page", 1);',                       # 1=home, not 3=restore session
     'user_pref("browser.sessionstore.resume_from_crash", false);', # no "restore?" after a hard kill
     'user_pref("browser.sessionstore.max_resumed_crashes", 0);',
     'user_pref("browser.sessionstore.resume_session_once", false);',
-    'user_pref("browser.warnOnQuit", false);',                     # Esc must quit without a prompt
+    'user_pref("browser.warnOnQuit", false);',                     # Esc must close without a prompt
     'user_pref("browser.tabs.warnOnClose", false);',
+    # no browsing history (logins/passwords/cookies are stored separately, kept)
+    'user_pref("places.history.enabled", false);',
+    # keep the Zen sidebar collapsed and stop it popping out on hover
+    'user_pref("zen.view.compact", true);',
+    'user_pref("zen.view.compact.enable-at-startup", true);',
+    'user_pref("zen.view.sidebar-expanded", false);',
+    'user_pref("zen.view.sidebar-expanded.on-hover", false);',
+    'user_pref("sidebar.visibility", "hide-sidebar");',
 ]
 SESSION_GLOBS = ['sessionstore.jsonlz4', 'sessionstore-backups/*', 'recovery.jsonlz4',
                  'sessionCheckpoints.json', 'zen-sessions.jsonlz4', 'zen-sessions-backup/*']
@@ -406,26 +508,20 @@ def ensure_prefs(prof):
             f.write('\n'.join(add) + '\n')
     return len(add)
 
-def ensure_esc(prof):
+def drop_dead_esc(prof):
+    # earlier versions tried to bind Esc inside Zen; kiosk ignores it, so the
+    # window manager handles Esc now (see zen-kiosk-launch.sh). Remove the dead
+    # entry if a previous run left one.
     f = os.path.join(prof, 'zen-keyboard-shortcuts.json')
-    if os.path.isfile(f):
-        try: data = json.load(open(f))
-        except Exception: data = None
-    else:
-        data = json.loads(json.dumps(template)) if template else None
-    if not isinstance(data, dict) or not isinstance(data.get('shortcuts'), list):
-        return 'no-template'
-    sc = data['shortcuts']
-    # drop any other plain-Escape binding, then add ours (idempotent)
-    def plain_esc(e):
-        mod = e.get('modifiers') or {}
-        return e.get('keycode') == 'VK_ESCAPE' and not any(mod.get(k) for k in
-               ('control', 'alt', 'shift', 'meta', 'accel'))
-    sc = [e for e in sc if not plain_esc(e)]
-    sc.append(ESC); data['shortcuts'] = sc
-    backup(f)
-    json.dump(data, open(f, 'w'), indent=2)
-    return 'ok'
+    if not os.path.isfile(f): return
+    try: data = json.load(open(f))
+    except Exception: return
+    sc = data.get('shortcuts')
+    if not isinstance(sc, list): return
+    new = [e for e in sc if not (isinstance(e, dict) and e.get('id') == 'key_quitAppOnEscape')]
+    if len(new) != len(sc):
+        data['shortcuts'] = new
+        json.dump(data, open(f, 'w'), indent=2)
 
 def clear_sessions(prof):
     n = 0
@@ -440,13 +536,12 @@ for name, prof in profiles:
     if not os.path.isdir(prof):
         print(f"{name}: profile dir missing, skipped ({prof})"); continue
     np = ensure_prefs(prof)
-    es = ensure_esc(prof)
+    drop_dead_esc(prof)
     cs = clear_sessions(prof)
-    esc_msg = {'ok': 'Esc->quit set', 'no-template': 'Esc->quit SKIPPED (no shortcuts template found)'}[es]
-    print(f"{name}: {esc_msg}; +{np} session prefs; cleared {cs} old session file(s)")
+    print(f"{name}: fresh-session prefs (+{np}); cleared {cs} old session file(s)")
 
 for name in shared:
-    print(f"{name}: shares the default Zen profile (no --profile=) — skipped to protect your main browser")
+    print(f"{name}: shares the default Zen profile — fresh-session skipped (Esc-close still works via the launcher)")
 PY
 }
 
@@ -475,11 +570,16 @@ if [ "$DO_FS" = "1" ]; then
     echo "fullscreen: SKIPPED — Steam is running (it would overwrite the change on exit)."
     echo "            Fully quit Steam, then rerun with --fullscreen."
   else
+    wrapper_arg=""
     for g in "${grids[@]}"; do
       vdf="$(dirname "$g")/shortcuts.vdf"
       [ -f "$vdf" ] || continue
+      if grep -aq 'app.zen_browser.zen' "$vdf" 2>/dev/null; then
+        install_zen_wrapper; wrapper_arg="$ZEN_WRAPPER"
+        echo "==> esc launcher: $ZEN_WRAPPER"
+      fi
       echo "==> fullscreen: $vdf"
-      apply_fullscreen "$vdf" | sed 's/^/    /'
+      apply_fullscreen "$vdf" "$wrapper_arg" | sed 's/^/    /'
       apply_app_quirks "$vdf" | sed 's/^/    /'
     done
   fi
