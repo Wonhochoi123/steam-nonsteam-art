@@ -141,10 +141,14 @@ PY
 
 slugify(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g'; }
 
-# hand-tuned slug overrides for names that don't map cleanly
+# hand-tuned slug overrides for names that don't map cleanly — e.g. a YouTube
+# client with its own brand name has no icon of its own, so borrow YouTube's.
+# Only alias apps that lack an icon under their own slug (don't override one
+# that has its own logo, e.g. FreeTube).
 slug_override(){
   case "$(slugify "$1")" in
-    audiobookshelf|audiobook-shelf) echo audiobookshelf ;;
+    audiobookshelf|audiobook-shelf)            echo audiobookshelf ;;
+    vacuumtube|vacuum-tube|youtube-tv|yttv)     echo youtube ;;
     *) echo "" ;;
   esac
 }
