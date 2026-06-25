@@ -70,21 +70,43 @@ generates art for any that don't have it yet.
 ### Fullscreen (optional)
 
 Web-app shortcuts (Immich, a YouTube tab, any self-hosted dashboard) are
-usually added as a chromium/brave **app window** (`--app=URL`). Pass
-`--fullscreen` and the tool rewrites those to **kiosk mode** (`--kiosk URL`) so
-they open borderless fullscreen, like a real game:
+usually added as a browser **app window**. Pass `--fullscreen` and the tool
+rewrites them to launch borderless-fullscreen kiosk mode, like a real game:
+
+- **chromium / brave / chrome** (`--app=URL`) → `--kiosk URL`
+- **Zen / Firefox** site-specific apps (`app.zen_browser.zen …`) → inserts
+  `--kiosk`
 
 ```bash
-# Quit Steam first, then:
+# Quit Steam first (and close the browser), then:
 ./steam-nonsteam-art.sh --fullscreen
 ```
 
 - **Off by default** — without the flag, launch options are never touched.
-- Only converts shortcuts it can do **safely** (chromium/brave/chrome `--app`);
-  native apps are left alone.
+- Only converts shortcuts it can do **safely**; native apps are left alone.
 - **Backs up `shortcuts.vdf`** before editing, and **refuses to run while Steam
   is open** (Steam would overwrite the change on exit).
 - Idempotent — already-fullscreen shortcuts are reported and skipped.
+
+#### Zen / Firefox web apps (Esc-to-quit + fresh session)
+
+Firefox-based site-specific apps (e.g. those created by **web-app-hub**) ignore
+chromium-style flags and keep their own per-app profile. For every Zen shortcut
+that has its **own** `--profile=`, `--fullscreen` also makes the profile
+kiosk-friendly:
+
+- **Esc quits the app** — binds plain `Escape` → `cmd_quitApplication` in the
+  profile's `zen-keyboard-shortcuts.json` (seeding it from an existing profile
+  if needed). `Ctrl+Q` works too.
+- **Each launch starts fresh** — disables tab/session restore in the profile's
+  `user.js` (`browser.startup.page=1`, `sessionstore.resume_from_crash=false`,
+  `warnOnQuit=false`, …) and clears the piled-up `sessionstore`/`zen-sessions`
+  files once. **Cookies/logins are kept** — only old tabs are forgotten.
+
+Every edited file is backed up (`.bak`), it's idempotent, and it **skips while
+Zen is running**. Shortcuts that share the **default** Zen profile (no
+`--profile=`) are **skipped on purpose**, so your everyday browser isn't
+affected — give such apps their own profile if you want the same behaviour.
 
 #### App quirks (config-based fullscreen)
 

@@ -22,12 +22,15 @@
 # Options:
 #   -f, --force        regenerate art even if it already exists
 #   -F, --fullscreen   ALSO make shortcuts launch fullscreen:
-#                        - browser shortcuts: --app=URL -> --kiosk URL
+#                        - Chromium/Brave shortcuts: --app=URL -> --kiosk URL
+#                        - Zen/Firefox site-specific apps: insert --kiosk, and
+#                          (per dedicated profile) bind Esc -> quit the app and
+#                          stop tab/session restore so each launch starts fresh
 #                        - known config-based apps (e.g. VacuumTube): flip the
 #                          app's own fullscreen setting ("app quirks")
 #                      Off by default; native apps without a known quirk are
-#                      left untouched. Requires Steam (and the quirk app) to be
-#                      closed; backs up every file it edits.
+#                      left untouched. Requires Steam (and the quirk app/browser)
+#                      to be closed; backs up every file it edits.
 #   -h, --help         show this help
 #
 # Env overrides:
@@ -247,6 +250,12 @@ def transform(name,val):
     low=val.lower()
     if b'--kiosk' in low or b'--start-fullscreen' in low: return val,'already'
     if b'--app=' in val: return val.replace(b'"--app=', b'"--kiosk" "'),'converted'
+    if b'app.zen_browser.zen' in low:
+        # site-specific Zen/Firefox app: insert "--kiosk" before the URL token
+        for scheme in (b'"http', b'"about:', b'"file:'):
+            k=val.find(scheme)
+            if k!=-1:
+                return val[:k]+b'"--kiosk" '+val[k:],'converted'
     return val,'unchanged'
 while i < len(d):
     t=d[i]; out.append(t); i+=1
@@ -304,10 +313,148 @@ quirk_vacuumtube(){
   json_set_true "$cfg" "fullscreen" "VacuumTube" "vacuumtube"
 }
 
+# Zen/Firefox site-specific apps (e.g. created by web-app-hub): for every shortcut
+# that launches app.zen_browser.zen with its own --profile=, make the profile
+# kiosk-friendly: bind plain Esc -> quit the app, and disable tab/session restore
+# so each launch opens just the URL (no piling-up of old tabs). Cookies/logins are
+# kept. Shortcuts that share the default Zen profile (no --profile=) are skipped so
+# the main browser is left untouched. Backs up every file it edits.
+quirk_zen_webapps(){
+  local vdf="$1"
+  grep -aq 'app.zen_browser.zen' "$vdf" 2>/dev/null || return 0
+  if pgrep -fi 'zen[-_]?browser|/zen\b|zen-bin' >/dev/null 2>&1; then
+    echo "Zen web apps: RUNNING — close Zen and rerun (it would overwrite the change on exit)"; return
+  fi
+  python3 - "$vdf" "$HOME" <<'PY'
+import sys, os, re, json, glob, shutil, time
+vdf, home = sys.argv[1], sys.argv[2]
+d = open(vdf, 'rb').read()
+
+# --- pull every LaunchOptions string out of the binary shortcuts.vdf ----------
+launch = []
+i = 0
+while i < len(d):
+    t = d[i]; i += 1
+    if t == 0x01:                       # string field: key\0 value\0
+        j = d.index(0, i); key = d[i:j]; i = j + 1
+        j = d.index(0, i); val = d[i:j]; i = j + 1
+        if key.lower() == b'launchoptions':
+            launch.append(val.decode('utf-8', 'replace'))
+    elif t == 0x02:                     # int field: key\0 + 4 bytes
+        j = d.index(0, i); i = j + 1 + 4
+    elif t == 0x00:                     # nested map: name\0
+        j = d.index(0, i); i = j + 1
+    elif t == 0x08:                     # end of map
+        pass
+    else:
+        break
+
+profiles, shared = [], []
+for lo in launch:
+    if 'app.zen_browser.zen' not in lo: continue
+    m = re.search(r'--profile=([^"]+)', lo)
+    name = (re.search(r'--name=([^"\s]+)', lo) or [None, lo[:40]])[1]
+    if m: profiles.append((name, m.group(1)))
+    else: shared.append(name)
+
+if not profiles and not shared:
+    print("(no Zen web-app shortcuts found)"); sys.exit(0)
+
+# --- a complete default zen-keyboard-shortcuts.json to seed bare profiles -----
+def find_template():
+    cands = [p for _, p in profiles]
+    cands += glob.glob(os.path.join(home, '.var/app/app.zen_browser.zen/*/zen*/*.default*'))
+    for base in cands:
+        f = os.path.join(base, 'zen-keyboard-shortcuts.json')
+        if os.path.isfile(f):
+            try:
+                j = json.load(open(f))
+                if isinstance(j, dict) and isinstance(j.get('shortcuts'), list) and j['shortcuts']:
+                    return j
+            except Exception: pass
+    return None
+template = find_template()
+
+ESC = {"id": "key_quitAppOnEscape", "key": None, "keycode": "VK_ESCAPE",
+       "group": "windowAndTabManagement", "l10nId": None,
+       "modifiers": {"control": False, "alt": False, "shift": False, "meta": False, "accel": False},
+       "action": "cmd_quitApplication", "disabled": False, "reserved": True, "internal": False}
+
+PREFS = [
+    'user_pref("browser.startup.page", 1);',                       # 1=home, not 3=restore session
+    'user_pref("browser.sessionstore.resume_from_crash", false);', # no "restore?" after a hard kill
+    'user_pref("browser.sessionstore.max_resumed_crashes", 0);',
+    'user_pref("browser.sessionstore.resume_session_once", false);',
+    'user_pref("browser.warnOnQuit", false);',                     # Esc must quit without a prompt
+    'user_pref("browser.tabs.warnOnClose", false);',
+]
+SESSION_GLOBS = ['sessionstore.jsonlz4', 'sessionstore-backups/*', 'recovery.jsonlz4',
+                 'sessionCheckpoints.json', 'zen-sessions.jsonlz4', 'zen-sessions-backup/*']
+
+def backup(p):
+    if os.path.exists(p) and not os.path.exists(p + '.bak'):
+        shutil.copy2(p, p + '.bak')
+
+def ensure_prefs(prof):
+    ujs = os.path.join(prof, 'user.js')
+    cur = open(ujs).read() if os.path.isfile(ujs) else ''
+    backup(ujs)
+    add = [p for p in PREFS if p.split(',')[0] not in cur]  # keyed on the pref name
+    if add:
+        with open(ujs, 'a') as f:
+            if cur and not cur.endswith('\n'): f.write('\n')
+            f.write('\n'.join(add) + '\n')
+    return len(add)
+
+def ensure_esc(prof):
+    f = os.path.join(prof, 'zen-keyboard-shortcuts.json')
+    if os.path.isfile(f):
+        try: data = json.load(open(f))
+        except Exception: data = None
+    else:
+        data = json.loads(json.dumps(template)) if template else None
+    if not isinstance(data, dict) or not isinstance(data.get('shortcuts'), list):
+        return 'no-template'
+    sc = data['shortcuts']
+    # drop any other plain-Escape binding, then add ours (idempotent)
+    def plain_esc(e):
+        mod = e.get('modifiers') or {}
+        return e.get('keycode') == 'VK_ESCAPE' and not any(mod.get(k) for k in
+               ('control', 'alt', 'shift', 'meta', 'accel'))
+    sc = [e for e in sc if not plain_esc(e)]
+    sc.append(ESC); data['shortcuts'] = sc
+    backup(f)
+    json.dump(data, open(f, 'w'), indent=2)
+    return 'ok'
+
+def clear_sessions(prof):
+    n = 0
+    for g in SESSION_GLOBS:
+        for p in glob.glob(os.path.join(prof, g)):
+            try:
+                os.replace(p, p + '.bak-%s' % time.strftime('%Y%m%d-%H%M%S')); n += 1
+            except OSError: pass
+    return n
+
+for name, prof in profiles:
+    if not os.path.isdir(prof):
+        print(f"{name}: profile dir missing, skipped ({prof})"); continue
+    np = ensure_prefs(prof)
+    es = ensure_esc(prof)
+    cs = clear_sessions(prof)
+    esc_msg = {'ok': 'Esc->quit set', 'no-template': 'Esc->quit SKIPPED (no shortcuts template found)'}[es]
+    print(f"{name}: {esc_msg}; +{np} session prefs; cleared {cs} old session file(s)")
+
+for name in shared:
+    print(f"{name}: shares the default Zen profile (no --profile=) — skipped to protect your main browser")
+PY
+}
+
 # dispatch quirks for whichever known apps are present in this shortcuts.vdf
 apply_app_quirks(){
   local vdf="$1"
   grep -aq 'rocks.shy.VacuumTube' "$vdf" 2>/dev/null && quirk_vacuumtube
+  grep -aq 'app.zen_browser.zen' "$vdf" 2>/dev/null && quirk_zen_webapps "$vdf"
   # add more apps here, e.g.:
   #   grep -aq '<signature>' "$vdf" && quirk_<name>
   return 0
